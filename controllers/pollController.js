@@ -2,19 +2,24 @@ import Poll from '../models/Poll.js';
 import Vote from '../models/Vote.js';
 import Badge from '../models/Badge.js';
 import User from '../models/User.js';
+import { analyzeSentiment } from '../utils/sentimentAnalyzer.js';
+import { getRecommendations } from '../utils/recommendationEngine.js';
+import { forecastPoll } from '../utils/votePredictor.js';
+import { detectAnomalies } from '../utils/anomalyDetector.js';
 
 // @desc    Create a new poll
 // @route   POST /api/polls
 // @access  Private/Staff/Admin
 export const createPoll = async (req, res) => {
     try {
-        const { title, description, options, visibility, anonymous, allowLiveResults, startTime, endTime } = req.body;
+        const { title, description, category, options, visibility, anonymous, allowLiveResults, startTime, endTime } = req.body;
 
         const formattedOptions = options.map(opt => ({ optionText: opt }));
 
         const poll = new Poll({
             title,
             description,
+            category: category || 'General',
             createdBy: req.user._id,
             options: formattedOptions,
             visibility,
@@ -142,6 +147,50 @@ export const votePoll = async (req, res) => {
     }
 };
 
+// @desc    Edit/update a poll
+// @route   PUT /api/polls/:id
+// @access  Private/Staff/Admin
+export const editPoll = async (req, res) => {
+    try {
+        const poll = await Poll.findById(req.params.id);
+        if (!poll) {
+            return res.status(404).json({ message: 'Poll not found' });
+        }
+
+        // Only the creator or admin can edit
+        if (poll.createdBy.toString() !== req.user._id.toString() && req.user.role !== 'Admin') {
+            return res.status(403).json({ message: 'Not authorized to edit this poll' });
+        }
+
+        const { title, description, category, options, visibility, anonymous, allowLiveResults, startTime, endTime } = req.body;
+
+        if (title) poll.title = title;
+        if (description !== undefined) poll.description = description;
+        if (category) poll.category = category;
+        if (visibility) poll.visibility = visibility;
+        if (anonymous !== undefined) poll.anonymous = anonymous;
+        if (allowLiveResults !== undefined) poll.allowLiveResults = allowLiveResults;
+        if (startTime) poll.startTime = startTime;
+        if (endTime) poll.endTime = endTime;
+
+        // Update options only if poll has no votes yet
+        if (options && options.length >= 2) {
+            const voteCount = await Vote.countDocuments({ pollId: poll._id });
+            if (voteCount === 0) {
+                poll.options = options.map(opt => ({
+                    optionText: typeof opt === 'string' ? opt : opt.optionText,
+                    voteCount: 0
+                }));
+            }
+        }
+
+        const updatedPoll = await poll.save();
+        res.json(updatedPoll);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+};
+
 // @desc    Delete a poll
 // @route   DELETE /api/polls/:id
 // @access  Private/Admin
@@ -171,10 +220,8 @@ export const getPollResults = async (req, res) => {
             return res.status(404).json({ message: 'Poll not found' });
         }
 
-        let votesQuery = Vote.find({ pollId: poll._id });
-        if (req.user.role === 'Admin') {
-            votesQuery = votesQuery.populate('userId', 'name email role department');
-        }
+        // Always populate department for demographics
+        let votesQuery = Vote.find({ pollId: poll._id }).populate('userId', 'name email role department');
         const votes = await votesQuery;
 
         // Group voters by the option they selected
@@ -193,14 +240,90 @@ export const getPollResults = async (req, res) => {
             return resultObj;
         });
 
+        // Calculate demographics
+        const demographicsObj = {};
+        votes.forEach(v => {
+            if (v.userId && v.userId.department) {
+                const dept = v.userId.department;
+                demographicsObj[dept] = (demographicsObj[dept] || 0) + 1;
+            } else if (v.userId && v.userId.role === 'Staff') {
+                demographicsObj['Staff'] = (demographicsObj['Staff'] || 0) + 1;
+            } else {
+                demographicsObj['Other'] = (demographicsObj['Other'] || 0) + 1;
+            }
+        });
+
+        const demographics = Object.keys(demographicsObj).map(key => ({
+            name: key,
+            value: demographicsObj[key]
+        }));
+
         res.json({
             pollTitle: poll.title,
             totalVotes: votes.length,
-            results
+            anonymous: poll.anonymous,
+            results,
+            demographics
         });
 
     } catch (error) {
         console.error("DEBUG ERROR: ", error);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Get AI analysis (sentiment, keywords, engagement prediction)
+// @route   GET /api/polls/:id/ai-analysis
+// @access  Private/Staff/Admin
+export const getAIAnalysis = async (req, res) => {
+    try {
+        const poll = await Poll.findById(req.params.id);
+        if (!poll) {
+            return res.status(404).json({ message: 'Poll not found' });
+        }
+
+        const analysis = analyzeSentiment(poll);
+        res.json(analysis);
+    } catch (error) {
+        console.error("AI Analysis Error: ", error);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Get ML-powered poll recommendations for current user
+// @route   GET /api/polls/recommendations
+// @access  Private
+export const getRecommendedPolls = async (req, res) => {
+    try {
+        const allPolls = await Poll.find({}).populate('createdBy', 'name');
+        const allVotes = await Vote.find({});
+
+        const recommendations = getRecommendations(req.user._id, allPolls, allVotes);
+        res.json(recommendations);
+    } catch (error) {
+        console.error("Recommendation Error: ", error);
+        res.status(500).json({ message: error.message });
+    }
+};
+
+// @desc    Get vote forecast + anomaly detection for a poll
+// @route   GET /api/polls/:id/forecast
+// @access  Private/Staff/Admin
+export const getPollForecast = async (req, res) => {
+    try {
+        const poll = await Poll.findById(req.params.id);
+        if (!poll) {
+            return res.status(404).json({ message: 'Poll not found' });
+        }
+
+        const votes = await Vote.find({ pollId: poll._id });
+
+        const forecast = forecastPoll(poll, votes);
+        const anomalies = detectAnomalies(poll, votes);
+
+        res.json({ forecast, anomalies });
+    } catch (error) {
+        console.error("Forecast Error: ", error);
         res.status(500).json({ message: error.message });
     }
 };

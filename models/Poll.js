@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 const pollSchema = new mongoose.Schema({
     title: { type: String, required: true },
     description: { type: String, required: true },
+    category: { type: String, enum: ['Academics', 'Events', 'General', 'Urgent', 'Facilities'], default: 'General' },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     options: [{
         optionText: { type: String, required: true },
